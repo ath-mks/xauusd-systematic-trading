@@ -1,0 +1,32 @@
+; XAU ExecutionProbe 1.04 - Strategy Tester check
+; Choose Every tick based on real ticks, XAUUSD M1, one historical weekday.
+; This preset only sets EA inputs; select dates/model in Strategy Tester Settings.
+; Monetary limits are in your account currency. Server offset +3 is provisional.
+InpEnableDemoOrders=true
+InpMagic=26101301
+InpRunId=101
+InpLots=0.01
+InpTargetPositions=200
+InpVolTicks=500
+InpMinDistance=0.10
+InpVolMultiplier=1.0
+InpInventoryGamma=0.5706715943
+InpMomentumProtection=true
+InpMaxSpread=0.20
+InpVolSpikeRatio=2.0
+InpRefreshMs=3000
+InpMaxQuoteAgeMs=6000
+InpMaxTickAgeMs=5000
+InpSessionLoss=10.0
+InpSessionDrawdown=10.0
+InpRunLoss=30.0
+InpRunDrawdown=30.0
+InpMinStopDistance=0.50
+InpStopDistanceMultiplier=4.0
+InpMaxHoldingSeconds=30
+InpFlattenOnRemove=true
+InpMaxConsecutiveErrors=5
+InpStartHourUTC=7
+InpEndHourUTC=17
+InpServerUTCOffsetHours=3
+InpTimerMs=100
