@@ -2,77 +2,12 @@
 
 Demo-only MT5 Expert Advisor for measuring XAUUSD pending-order execution. It places one entry order at a time, manages at most one position, and records quotes, requests, transactions, fills and costs. It refuses real accounts. Strategy Tester runs are explicitly labeled simulations.
 
-This package contains source code, presets and verification materials. **It has not been compiled in MetaEditor or run against a broker in this environment.** Compile and inspect a short demo run before collecting the longer sample.
 
 ## Version 1.04: reduce history work in longer backtests
 
 Raising `InpTargetPositions` allows a longer run and a larger trade history. Earlier versions rebuilt that history every simulated second and repeatedly searched every stored position and deal. These nested linear searches caused sharply increasing work as the sample grew.
 
 Version 1.04 uses sorted ticket tables with binary searches. In tester mode it reuses unchanged history totals, invalidating them on a deal-count change, a deal add/update/delete callback, a day change or a backward clock change. It also performs a full audit at least once per simulated minute and forces final recovery during shutdown. A failed history selection still halts the run. Demo history refresh cadence remains unchanged. Inputs, quote timing, tick ingestion, CSV schemas and risk thresholds are unchanged.
-
-Install by stopping any attached demo instance and confirming flat/no pending orders, replacing both source files, and compiling `XAU_ExecutionProbe.mq5` with F7. Confirm version **1.04**. Rerun the same tester dates and inputs to compare; retain real-tick testing. This removes identified source-level history bottlenecks, but no MT5 elapsed-time benchmark is available from this environment. Full tick CSV logging and the 100 ms timer still make long tests expensive; increasing the target does not guarantee a practical runtime for an arbitrarily large sample.
-
-## Version 1.03: finish the tester at the sample target
-
-The Journal message `XEP RUN_HALT: Target completed; collect CSV files` means the completed-position target was reached (200 by default). Earlier versions stopped placing orders but continued processing and logging the remaining historical dates. This could make a backtest appear stuck.
-
-Version 1.03 finishes a tester run normally with `TesterStop()` once the target is reached, positions and orders are absent, and fill/position reconciliation is complete. It saves state, flushes the logs and records `TESTER_COMPLETE` before requesting completion. MT5 retains the statistics accumulated so far. This is a **partial-period sample**, not a test of the entire selected date range. Ambiguous requests or inconsistent exposure prevent this early-completion path until resolved.
-
-Replace both source files and compile with F7; confirm the current version **1.04**. First stop any attached demo instance and confirm it has no positions or pending orders, as recompilation can reinitialize it. Preserve customized inputs. To collect more than 200 completed positions, increase `InpTargetPositions` in the **Strategy Tester → Inputs** tab. Loss/drawdown limits still apply. Demo behavior, position size, SL/TP, risk thresholds and the default target are unchanged.
-
-## Version 1.02: Strategy Tester compatibility
-
-The user reported that version 1.01 works on a demo chart but not in a backtest. Source inspection found strategy deadlines driven by elapsed host time, which is inappropriate for accelerated historical playback, and a requirement for live terminal permissions during simulated trading. The tester Journal was not supplied, so a separate launch, history-download or configuration failure has not been ruled out.
-
-Version 1.02 uses simulated server/tick time for tester quote age, repricing, holding deadlines and request pacing. The clock cannot move backward when a tick read is temporarily unavailable. Demo mode retains the local monotonic strategy clock and all demo permission checks. Tester mode obtains its features from delivered `OnTick` events and does not call `CopyTicks` to prefetch history. It requires 1,001 valid delivered ticks before quoting.
-
-To install, first stop the existing demo EA and confirm flat/no pending orders before overwriting and recompiling its files; recompilation may reinitialize an attached EA. Retain your current demo input settings if you customized them. For a controlled tester check:
-
-1. Compile the updated source with F7 and verify zero errors, then select **XAU_ExecutionProbe** in MT5 Strategy Tester (Ctrl+R).
-2. Select the exact broker **XAUUSD** symbol and **M1**. The strategy uses ticks; M1 is a convenient display period.
-3. Select **Every tick based on real ticks**. Do not use Open prices only or 1 minute OHLC for this tick-dependent logic.
-4. Start with one complete weekday, for example **2026.09.15 to 2026.09.16**, if the broker supplies history for it. Set **Optimization: Disabled** and use a local testing agent. An initial visual run makes the chart status visible.
-5. In the tester's **Inputs** tab, load `XAU_Backtest_Check.set`. This uses the original 0.01-lot baseline, original risk limits and test RunId 101. Inputs on an attached demo chart are not automatically the tester's inputs. The tester's global variables are separate from the demo terminal's state.
-6. Leave `InpServerUTCOffsetHours=3` for the September interval being examined, subject to verification against that history. The entry window remains 07:00–17:00 UTC: with this offset, 10:00–20:00 in recorded broker time. Today's wall-clock time does not restrict historical entries.
-7. Start the test and inspect the **Strategy Tester → Journal** tab if it cannot initialize, load history or place orders. For diagnosis, send the first error and surrounding messages, the tester Settings screenshot and any chart status.
-
-The default 100 ms timer and CSV logging make this slower than a bar-based EA; do the one-day check before a month or an optimization. The sample target of 200 completed positions and daily/run risk stops remain active. From version 1.03, reaching the sample target completes the tester early after reconciliation. A daily risk stop still waits for the next UTC day; other run stops can produce a flat equity segment through the remaining test. A completed test with zero trades still needs its status/logs inspected; it is not automatically a timing bug.
-
-Between quote events, the tester clock uses the simulated server's second-resolution time; on quote events it also uses the tick's millisecond timestamp. It does not promise exact subsecond exits between ticks. CSV `*_mono_us` observations and `call_duration_ms` remain host-runtime measurements; in the tester, these are processing measurements, **not simulated broker latency**. Metadata identifies both clock domains and tester tick ingestion. Test fills remain simulated even with real historical quotes.
-
-## Upgrade after the invalid-expiration stop
-
-Version 1.01 prefers GTC (good till cancelled) when the symbol advertises it. Version 1.00 selected a 15-second specified expiration on PepperstoneUK-Demo XAUUSD; the supplied logs show five rejections with code 10022, "Invalid expiration". They do not reveal the broker's minimum acceptable expiry. Normal cancellation/repricing remains controlled by the EA's 3-second timer.
-
-1. Confirm in MT5's Trade tab that XAUUSD has no positions or pending orders, then remove the old EA from the chart.
-2. Replace the two source files in the existing Experts folder and compile `XAU_ExecutionProbe.mq5` with F7.
-3. Reattach the EA, load the preset, and change **InpRunId from 1 to 2** for this corrected demo run. The old run deliberately retains its rejection halt. Do not delete terminal global variables or disable the rejection limit.
-4. Confirm the chart displays **1.04**. Keep Algo Trading enabled and the terminal connected. Observe a short run and retrieve fresh logs if another rejection occurs.
-
-With GTC selected, pending orders have no specified expiry and can remain at the broker after a disconnection or shutdown. Use STOP & FLATTEN while connected, confirm flat/no pending orders, then stop the terminal. The new version does not silently reset risk stops.
-
-## Install and compile
-
-1. Extract this ZIP.
-2. In MT5, choose **File → Open Data Folder**. Open `MQL5\Experts` and create a folder named `XAU_ExecutionProbe`.
-3. Copy **both** `XAU_ExecutionProbe.mq5` and `MMCore.mqh` into that folder. Keep them together.
-4. Press **F4** to open MetaEditor. Open `XAU_ExecutionProbe.mq5`, then press **F7** to compile. Proceed only after the compiler reports zero errors. If it reports errors, send the exact error text and line numbers for correction. A successful local compile creates the `.ex5` file.
-5. Return to MT5. In **Navigator → Expert Advisors**, right-click and refresh if necessary.
-
-No DLL, Python installation or WebRequest configuration is needed to run the EA. The included Python/C++ files are developer verification tools, not MT5 dependencies.
-
-## Start the demo run
-
-1. Connect to your **Pepperstone Razor demo account**. Use a dedicated XAUUSD symbol/account without manual trades or another EA trading that symbol. Open your broker's exact XAUUSD chart; suffixes are accepted. Any chart timeframe works because the EA uses ticks.
-2. Drag `XAU_ExecutionProbe` onto the chart. In **Inputs**, choose **Load** and select the extracted `XAU_Demo_Execution.set` file.
-3. Check that `InpLots=0.01` is appropriate for this demo and valid for the broker's symbol. The EA rejects an invalid size; it never rounds up to a larger lot.
-4. Check `InpServerUTCOffsetHours`. The preset uses **+3 provisionally**. Compare current broker time with UTC while connected, and adjust if necessary. Live session scheduling uses UTC directly; this offset is used to assign history to UTC days and for tester timing. Update it when the broker changes its offset.
-5. Allow algorithmic trading in the EA settings and enable the MT5 **Algo Trading** toolbar button. The preset enables demo orders, so eligible entries can begin after initialization.
-6. Watch the first few fills. Confirm the symbol and lot size, no more than one position, and that filled positions have a server SL and TP. If compilation or terminal behavior differs from these expectations, stop the probe and send the logs.
-
-The default entry session is **07:00–17:00 UTC, Monday–Friday**, with new entries ending 30 seconds early. Warmup requires 1,001 valid quotes; available recent tick history can satisfy it on a demo chart. In the tester, warmup uses ticks delivered after the test begins. The chart displays status, warmup, completed positions and P&L. Outside the session or when filters block entries, it can remain idle normally.
-
-Start with a short observed demo run. If behavior matches the settings, continue toward the target of **200 completed positions**. A risk stop or a smaller sample is still useful; do not repeatedly reset a stopped run merely to reach 200.
 
 ## Default behavior
 
@@ -116,15 +51,6 @@ This differs from simultaneously resting both buy and sell quotes. It is a seria
 - Foreign activity on XAUUSD halts the probe. If a foreign deal may have changed a shared netting position, the EA stops modifying or closing that position to avoid acting on mixed ownership; inspect it manually. Existing server SL/TP may still execute.
 - Use only one EA instance for this account/symbol. The instance lock covers one terminal, not other terminal installations. Do not run the same experiment from two terminals.
 
-## Retrieve the logs
-
-In MT5, choose **File → Open Data Folder**, then open:
-
-```text
-MQL5\Files\XAU_ExecutionProbe\<symbol_date_time_uptime>\
-```
-
-The exact folder is also printed in the Experts log and displayed on the chart. After stopping and checking flat/no pending orders, ZIP the **whole run folder** and send it back. Include every folder if you restarted the EA. No account password is needed. Tester output is in the tester agent's separate file sandbox.
 
 | File | Contents |
 |---|---|
