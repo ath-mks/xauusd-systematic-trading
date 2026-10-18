@@ -1,0 +1,1 @@
+stage,reason,send_mono_us,reply_mono_us,call_duration_ms,local_utc_seconds,request_id,action,order_type,request_order,position_ticket,volume,requested_price,sl,tp,time_type,expiration_server,filling_type,retcode,retcode_external,api_return,last_error,result_order,result_deal,result_price,result_bid,result_ask,snapshot_server_msc,snapshot_bid,snapshot_ask,comment

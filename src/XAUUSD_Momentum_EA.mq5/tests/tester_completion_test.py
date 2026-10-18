@@ -6,7 +6,7 @@ import tempfile
 import unittest
 
 ROOT=Path(__file__).resolve().parents[1]
-SOURCE=(ROOT/'XAU_ExecutionProbe.mq5').read_text()
+SOURCE=(ROOT/'XAU_ExecutionProbe_v3.mq5').read_text()
 
 def extract(name):
     m=re.search(r'bool\s+'+name+r'\s*\(',SOURCE)
@@ -27,7 +27,7 @@ class TesterCompletion(unittest.TestCase):
 #include <string>
 using ulong=unsigned long;
 using string=std::string;
-struct Exposure {int positions;int orders;bool foreign;};
+struct Exposure {int positions;int orders;bool foreign;ulong exitorder=0;};
 bool g_test=true,g_runhalt=true,g_ambiguous=false,g_contaminated=false;
 bool g_closepending=false,g_testerstopping=false,ledger=true;
 ulong g_entrybarrier=0,g_closebarrier=0;
@@ -45,11 +45,13 @@ void TesterStop(){assert(!sequence.empty()&&sequence.back()=='K');sequence+='T';
 int main(){
  Exposure e{0,0,false};
  g_test=false;assert(!FinishTesterAtTarget(e));g_test=true;
+ InpTargetPositions=0;assert(!FinishTesterAtTarget(e));InpTargetPositions=200;
  g_completed=199;assert(!FinishTesterAtTarget(e));g_completed=200;
  g_runhalt=false;assert(!FinishTesterAtTarget(e));g_runhalt=true;
  e.positions=1;assert(!FinishTesterAtTarget(e));e.positions=0;
  e.orders=1;assert(!FinishTesterAtTarget(e));e.orders=0;
  e.foreign=true;assert(!FinishTesterAtTarget(e));e.foreign=false;
+ e.exitorder=88;assert(!FinishTesterAtTarget(e));e.exitorder=0;
  g_entrybarrier=99;assert(!FinishTesterAtTarget(e));g_entrybarrier=0;
  g_closebarrier=99;assert(!FinishTesterAtTarget(e));g_closebarrier=0;
  g_closepending=true;assert(!FinishTesterAtTarget(e));g_closepending=false;

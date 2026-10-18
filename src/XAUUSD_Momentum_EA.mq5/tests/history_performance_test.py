@@ -6,7 +6,7 @@ import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-SOURCE = (ROOT / 'XAU_ExecutionProbe.mq5').read_text()
+SOURCE = (ROOT / 'XAU_ExecutionProbe_v3.mq5').read_text()
 
 def function(name):
     match = re.search(r'(?:int|bool|void)\s+' + name + r'\s*\(', SOURCE)
@@ -35,7 +35,7 @@ struct Id {
  Id()=default; Id(ulong x):value(x){}
  operator ulong()const {comparisons++;return value;}
 };
-struct PositionLedger {Id id;double netvol=0;bool entry=false;bool exit=false;};
+struct PositionLedger {Id id;double netvol=0;bool entry=false;bool exit=false;long firstentry=0;double entrycost=0,entryvolume=0;};
 struct LoggedDeal {Id ticket;double price=0,volume=0,profit=0,commission=0,swap=0,fee=0;};
 std::vector<PositionLedger> g_ledger;
 std::vector<LoggedDeal> g_loggedDeals;
@@ -44,7 +44,7 @@ template<class T> int ArrayResize(std::vector<T>& a,int n,int reserve=0){
  if(n>(int)a.capacity())a.reserve(n+reserve);a.resize(n);return n;
 }
 bool g_test=true,g_historydirty=true,g_runhalt=false,g_contaminated=false;
-int g_historycount=-1,g_historyday=-1,g_day=1,g_completed=0;
+int g_historycount=-1,g_historyday=-1,g_day=1,g_completed=0,g_dayentries=0;
 datetime g_historytime=0,g_epoch=0,clock_now=90000;
 long InpMagic=7;
 int InpServerUTCOffsetHours=0;
@@ -94,6 +94,7 @@ double HistoryOrderGetDouble(ulong,int){return 0;}
 long HistoryOrderGetInteger(ulong,int){return 0;}
 int AccountInfoInteger(int){return margin_mode;}
 void StopRun(string){g_runhalt=true;}
+double MathMax(double a,double b){return std::fmax(a,b);}
 double MathAbs(double x){return std::abs(x);}
 struct MqlTick {long time_msc=0;double bid=0,ask=0;};
 void ZeroMemory(MqlTick& t){t=MqlTick();}
@@ -137,15 +138,15 @@ int main(int argc,char** argv){
   assert(KnownPosition(900)&&KnownPosition(100)&&KnownPosition(500)&&!KnownPosition(200));
  }else if(test=="accounting"){
   baseline();RefreshPnL();
-  assert(g_completed==1);close(g_realized,2.6);close(g_dayrealized,2.7);
+  assert(g_completed==1);assert(g_dayentries==1);close(g_realized,2.6);close(g_dayrealized,2.7);
   close(g_ledger[LedgerIndex(100)].netvol,-0.01);
   assert(rows==4);
   for(auto& d:deals)assert(LoggedIndex(d.ticket)>=0);
   RefreshPnL();assert(rows==4);
   add(5,100,DEAL_TYPE_BUY,DEAL_ENTRY_OUT,0.01,-1);
-  RefreshPnL();assert(g_completed==2);close(g_realized,1.5);assert(rows==5);
+  RefreshPnL();assert(g_completed==2);assert(g_dayentries==1);close(g_realized,1.5);assert(rows==5);
   D(10).profit=4;g_historydirty=true;RefreshPnL();close(g_realized,3.5);assert(rows==6);
-  g_day=2;clock_now=172810;RefreshPnL();close(g_dayrealized,0);assert(g_completed==2);
+  g_day=2;clock_now=172810;RefreshPnL();close(g_dayrealized,0);assert(g_dayentries==0);assert(g_completed==2);
   add(80,100,DEAL_TYPE_BUY,DEAL_ENTRY_IN,0.01,0,172810,99);
   RefreshPnL();assert(g_runhalt&&g_contaminated);assert(g_completed==1);
  }else if(test=="cache"){
@@ -160,6 +161,15 @@ int main(int argc,char** argv){
   deals.erase(deals.begin());RefreshPnL();close(g_realized,4.7);
   g_test=false;reads=0;RefreshPnL();RefreshPnL();assert(reads>0); // demo full refresh retained
   history_ok=false;RefreshPnL();assert(g_runhalt); // cache cannot mask a failed select
+ }else if(test=="daily"){
+  add(1,11,DEAL_TYPE_BUY,DEAL_ENTRY_IN,.02,0,90000);
+  add(2,11,DEAL_TYPE_BUY,DEAL_ENTRY_IN,.03,0,172810);
+  add(3,22,DEAL_TYPE_SELL,DEAL_ENTRY_IN,.05,0,172811);
+  g_day=2;clock_now=172820;RefreshPnL();assert(g_dayentries==1&&g_completed==0);
+  add(4,11,DEAL_TYPE_SELL,DEAL_ENTRY_OUT,.05,1,172830);
+  clock_now=172840;RefreshPnL();assert(g_dayentries==1&&g_completed==1);
+  g_historydirty=true;g_ledger.clear();RefreshPnL();assert(g_dayentries==1);
+  g_day=3;clock_now=259210;RefreshPnL();assert(g_dayentries==0);
  }else return 2;
 }
 '''
@@ -188,6 +198,8 @@ class HistoryPerformance(unittest.TestCase):
     def test_lookup_work_grows_logarithmically(self): self.run_case('lookups')
     def test_totals_partial_fills_revisions_and_foreign_deals(self): self.run_case('accounting')
     def test_unchanged_tester_history_is_reused_and_invalidated(self): self.run_case('cache')
+
+    def test_daily_limit_counts_first_entry_once_across_partial_fills_and_restart(self): self.run_case('daily')
 
     def test_deal_updates_and_teardown_invalidate_cache(self):
         callback = SOURCE[SOURCE.index('void OnTradeTransaction('):SOURCE.index('void OnChartEvent(')]

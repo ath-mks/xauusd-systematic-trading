@@ -1,0 +1,3 @@
+observed_mono_us,local_utc_seconds,event,message
+133789,1792024177,START,"GBP demo forward execution; source logger v3.00"
+5817390,1792024183,DEINIT,"Reason 1; best-effort cleanup"

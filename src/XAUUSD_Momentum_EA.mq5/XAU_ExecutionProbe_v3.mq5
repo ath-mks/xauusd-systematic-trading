@@ -1,14 +1,17 @@
 #property strict
-#property version "1.04"
-#property description "Demo-only XAU execution measurement. One entry order, one position."
+#property version "3.01"
+#property description "GBP demo XAU probe. Original versus cost-aware adaptive TP."
 #include "MMCore.mqh"
+#include "MMPositionBook.mqh"
 
 input group "Demo execution probe"
 input bool   InpEnableDemoOrders=true;
-input long   InpMagic=26101301;
+input long   InpMagic=26101503;
 input int    InpRunId=1;                 // Change only when flat to start a new measurement run
-input double InpLots=0.01;
-input int    InpTargetPositions=200;
+input double InpLots=0.10;              // Per position; gross cap = lots * max positions
+input int    InpMaxPositions=1;         // Simultaneous positions, 1..100
+input int    InpMaxPositionsPerDay=2000; // Newly opened positions per UTC day
+input int    InpTargetPositions=0;      // Optional overall run target; 0 = full test period
 input group "Quotes (prices in USD per ounce for standard XAUUSD)"
 input int    InpVolTicks=500;
 input double InpMinDistance=0.10;
@@ -20,11 +23,15 @@ input double InpVolSpikeRatio=2.0;
 input int    InpRefreshMs=3000;
 input int    InpMaxQuoteAgeMs=6000;
 input int    InpMaxTickAgeMs=5000;
+input group "Take profit comparison (GBP)"
+input bool   InpCostAwareTP=true;       // false reproduces original gamma TP
+input double InpCommissionRoundTripPerLot=4.50; // Estimate: GBP per 1.00 lot, both sides
+input double InpTPProfitBuffer=0.10;    // GBP per position, independent of lots
 input group "Risk (money amounts in account currency)"
-input double InpSessionLoss=10.0;
-input double InpSessionDrawdown=10.0;
-input double InpRunLoss=30.0;
-input double InpRunDrawdown=30.0;
+input double InpSessionLoss=100.0;
+input double InpSessionDrawdown=100.0;
+input double InpRunLoss=300.0;
+input double InpRunDrawdown=300.0;
 input double InpMinStopDistance=0.50;
 input double InpStopDistanceMultiplier=4.0;
 input int    InpMaxHoldingSeconds=30;
@@ -38,6 +45,7 @@ input int    InpTimerMs=100;
 
 MMFeatures g_features;
 MMSignal g_signal;
+MMPositionBook g_positions;
 string g_symbol,g_folder,g_key,g_lock,g_status="INITIALIZING",g_server;
 long g_login=0;
 double g_ticksize=0,g_point=0,g_vstep=0,g_locktoken=0;
@@ -50,12 +58,12 @@ bool g_historydirty=true;
 int g_historycount=-1,g_historyday=-1;
 datetime g_historytime=0;
 bool g_ambiguous=false,g_busy=false,g_caughtup=false,g_ownedlock=false;
-bool g_contaminated=false,g_closepending=false;
+bool g_contaminated=false,g_closepending=false,g_canceldeferred=false;
 ulong g_closedeal=0;
 ulong g_strategyus=0;
-ulong g_lasttick=0,g_lastnewus=0,g_quoteus=0,g_modifyus=0,g_posdeadlineus=0,g_nexttradeus=0;
-ulong g_summaryus=0,g_flushus=0,g_displayus=0,g_entrybarrier=0,g_closebarrier=0,g_posid=0;
-int g_same=0,g_day=0,g_completed=0;
+ulong g_lasttick=0,g_lastnewus=0,g_quoteus=0,g_nexttradeus=0;
+ulong g_summaryus=0,g_flushus=0,g_displayus=0,g_entrybarrier=0,g_closebarrier=0;
+int g_same=0,g_day=0,g_completed=0,g_dayentries=0;
 datetime g_epoch=0;
 double g_realized=0,g_dayrealized=0,g_runpeak=0,g_daypeak=0,g_float=0;
 struct LoggedDeal {ulong ticket;double price;double volume;double profit;double commission;double swap;double fee;};
@@ -65,10 +73,10 @@ string BUTTON="XEP_STOP_FLATTEN";
 
 struct Exposure
 {
- int positions; int orders; bool foreign;
- double volume; ulong position; ulong order;
+ int positions; int orders; bool foreign; bool partial;
+ double volume; double pendingvolume; ulong position; ulong order; ulong exitorder;
 };
-struct PositionLedger {ulong id;double netvol;bool entry;bool exit;};
+struct PositionLedger {ulong id;double netvol;bool entry;bool exit;long firstentry;double entrycost;double entryvolume;};
 PositionLedger g_ledger[];
 
 string Q(string s){StringReplace(s,"\"","\"\"");return "\""+s+"\"";}
@@ -78,7 +86,7 @@ void W(uint written){if(written==0){g_iofail=true;Print("XEP: CSV write failed; 
 datetime UTCNow(){if(g_test)return TimeCurrent()-InpServerUTCOffsetHours*3600;return TimeGMT();}
 int DayNumber(){return (int)((long)UTCNow()/86400);}
 bool IsDemo(){return g_test||AccountInfoInteger(ACCOUNT_TRADE_MODE)==ACCOUNT_TRADE_MODE_DEMO;}
-bool AccountMatches(){return AccountInfoInteger(ACCOUNT_LOGIN)==g_login&&AccountInfoString(ACCOUNT_SERVER)==g_server;}
+bool AccountMatches(){return AccountInfoInteger(ACCOUNT_LOGIN)==g_login&&AccountInfoString(ACCOUNT_SERVER)==g_server&&AccountInfoString(ACCOUNT_CURRENCY)=="GBP";}
 bool TradePermissions()
 {
  if(!IsDemo()||!AccountMatches())return false;
@@ -130,11 +138,11 @@ int LedgerIndex(ulong id)
  if(k<n&&g_ledger[k].id==id)return k;
  ArrayResize(g_ledger,n+1,256);
  for(int i=n;i>k;i--)g_ledger[i]=g_ledger[i-1];
- g_ledger[k].id=id;g_ledger[k].netvol=0;g_ledger[k].entry=false;g_ledger[k].exit=false;return k;
+ g_ledger[k].id=id;g_ledger[k].netvol=0;g_ledger[k].entry=false;g_ledger[k].exit=false;g_ledger[k].firstentry=0;g_ledger[k].entrycost=0;g_ledger[k].entryvolume=0;return k;
 }
 Exposure Scan()
 {
- Exposure e;e.positions=0;e.orders=0;e.foreign=false;e.volume=0;e.position=0;e.order=0;
+ Exposure e;e.positions=0;e.orders=0;e.foreign=false;e.partial=false;e.volume=0;e.pendingvolume=0;e.position=0;e.order=0;e.exitorder=0;
  for(int i=PositionsTotal()-1;i>=0;i--)
  {
   ulong t=PositionGetTicket(i);if(t==0||PositionGetString(POSITION_SYMBOL)!=g_symbol)continue;
@@ -145,9 +153,52 @@ Exposure Scan()
  {
   ulong t=OrderGetTicket(i);if(t==0||OrderGetString(ORDER_SYMBOL)!=g_symbol)continue;
   if(OrderGetInteger(ORDER_MAGIC)!=InpMagic){e.foreign=true;continue;}
-  e.orders++;e.order=t;
+  long type=OrderGetInteger(ORDER_TYPE);
+  if(type!=ORDER_TYPE_BUY_LIMIT&&type!=ORDER_TYPE_SELL_LIMIT)
+  {
+   // Server stops create market exit orders with our magic. They may be visible
+   // before the closing deal/position update: reserve them for reconciliation,
+   // never classify them as foreign activity or count/cancel them as entries.
+   long reason=OrderGetInteger(ORDER_REASON);
+   if((type==ORDER_TYPE_BUY||type==ORDER_TYPE_SELL)
+      &&(reason==ORDER_REASON_TP||reason==ORDER_REASON_SL||reason==ORDER_REASON_SO))
+   {e.exitorder=t;continue;}
+   // A working market close is reconciled by the close pipeline, not reserved
+   // as another entry. Other unexpected own order types require inspection.
+   if(g_closepending)continue;
+   e.foreign=true;continue;
+  }
+  e.orders++;e.order=t;e.pendingvolume+=OrderGetDouble(ORDER_VOLUME_CURRENT);
+  if(OrderGetDouble(ORDER_VOLUME_CURRENT)<OrderGetDouble(ORDER_VOLUME_INITIAL)-g_vstep/2)e.partial=true;
  }
  return e;
+}
+bool EntryCapacity(const Exposure &e)
+{
+ return e.exitorder==0&&g_dayentries<InpMaxPositionsPerDay
+        &&MMEntryAllowed(e.positions,e.orders,e.volume,e.pendingvolume,InpLots,InpMaxPositions,g_vstep,g_completed,InpTargetPositions);
+}
+void SyncPositionStates()
+{
+ // First retain known live identifiers and reclaim closed slots before allocating
+ // new ones. This also handles a full timing book with one replacement position.
+ g_positions.BeginScan();
+ for(int i=PositionsTotal()-1;i>=0;i--)
+ {
+  ulong t=PositionGetTicket(i);if(t==0||PositionGetString(POSITION_SYMBOL)!=g_symbol||PositionGetInteger(POSITION_MAGIC)!=InpMagic)continue;
+  ulong id=(ulong)PositionGetInteger(POSITION_IDENTIFIER);
+  if(g_positions.Find(id)>=0)g_positions.Track(id,0,StrategyNowUS(),InpMaxHoldingSeconds*1000.0);
+ }
+ g_positions.EndScan();g_positions.BeginScan();ulong now=StrategyNowUS();
+ MqlTick observed;ZeroMemory(observed);SymbolInfoTick(g_symbol,observed);
+ long serverms=(long)MathMax((double)TimeCurrent()*1000,(double)observed.time_msc);
+ for(int i=PositionsTotal()-1;i>=0;i--)
+ {
+  ulong t=PositionGetTicket(i);if(t==0||PositionGetString(POSITION_SYMBOL)!=g_symbol||PositionGetInteger(POSITION_MAGIC)!=InpMagic)continue;
+  double elapsed=(double)(serverms-PositionGetInteger(POSITION_TIME_MSC));
+  if(g_positions.Track((ulong)PositionGetInteger(POSITION_IDENTIFIER),elapsed,now,InpMaxHoldingSeconds*1000.0)<0)StopRun("Position timer capacity exceeded");
+ }
+ g_positions.EndScan();
 }
 double MinimumDistance(){return MathMax(g_ticksize,(MathMax((double)SymbolInfoInteger(g_symbol,SYMBOL_TRADE_STOPS_LEVEL),(double)SymbolInfoInteger(g_symbol,SYMBOL_TRADE_FREEZE_LEVEL))+1)*g_point);}
 double P(double x){return NormalizeDouble(x,g_digits);}
@@ -174,10 +225,10 @@ bool Send(MqlTradeRequest &r,string why,MqlTradeResult &res)
  r.magic=(ulong)InpMagic;r.symbol=g_symbol;
  if(r.action==TRADE_ACTION_PENDING)
  {
-  Exposure e=Scan();if(e.foreign||e.positions>0||e.orders>0||g_entrybarrier!=0||g_closepending)return false;
+  Exposure e=Scan();if(e.foreign||!EntryCapacity(e)||g_entrybarrier!=0||g_closepending)return false;
   if(!LiveLedgerMatches())return false;
   if(MMRiskHit(g_dayrealized,g_daypeak,InpSessionLoss,InpSessionDrawdown)){g_dayhalt=true;SaveRisk();return false;}
-  if(MMRiskHit(g_realized,g_runpeak,InpRunLoss,InpRunDrawdown)||g_completed>=InpTargetPositions){StopRun("Run limit reached before new entry");return false;}
+  if(MMRiskHit(g_realized,g_runpeak,InpRunLoss,InpRunDrawdown)||(InpTargetPositions>0&&g_completed>=InpTargetPositions)){StopRun("Run limit reached before new entry");return false;}
   MqlTradeCheckResult check;ZeroMemory(check);ResetLastError();
   bool checked=OrderCheck(r,check);
   if(!checked){res.retcode=check.retcode;res.comment=check.comment;ulong now=GetMicrosecondCount();RequestRow("CHECK_REJECT",why,r,res,now,now,false,GetLastError());g_errors++;g_nexttradeus=StrategyNowUS()+1000000;return false;}
@@ -256,6 +307,18 @@ bool ClosePosition(ulong ticket,string why)
  r.deviation=20;r.type_filling=MarketFilling();r.comment="XEP risk exit";
  return Send(r,why,res);
 }
+// Uses executable exit price, so spread must not be added a second time.
+bool CostFloor(int side,double entry,double volume,double costs,double &floorprice)
+{
+ double step=MathMax(g_ticksize,1.0),profit=0;
+ ENUM_ORDER_TYPE type=side>0?ORDER_TYPE_BUY:ORDER_TYPE_SELL;
+ if(!OrderCalcProfit(type,g_symbol,volume,entry,entry+side*step,profit)||!MathIsValidNumber(profit)||profit<=0)return false;
+ floorprice=MMCostFloor(side,entry,costs,InpTPProfitBuffer,profit/step,g_ticksize);
+ double check=0;
+ return floorprice>0&&MathIsValidNumber(floorprice)
+        &&OrderCalcProfit(type,g_symbol,volume,entry,floorprice,check)
+        &&MathIsValidNumber(check)&&check+1e-7>=costs+InpTPProfitBuffer;
+}
 void PlaceEntry(const MqlTick &tick)
 {
  int side=MMEntrySide(g_signal.z,InpMomentumProtection,g_nextside);
@@ -265,6 +328,12 @@ void PlaceEntry(const MqlTick &tick)
  MqlTradeRequest r;MqlTradeResult res;ZeroMemory(r);r.action=TRADE_ACTION_PENDING;r.type=side>0?ORDER_TYPE_BUY_LIMIT:ORDER_TYPE_SELL_LIMIT;
  r.volume=InpLots;r.price=P(price);r.sl=P(MMRound(price-side*stop,g_ticksize,-side));
  r.tp=P(MMRound(price+side*MathMax(2*delta,minimum),g_ticksize,side));
+ if(InpCostAwareTP)
+ {
+  double floorprice=0,costs=MMTargetCosts(0,0,0,InpLots,InpCommissionRoundTripPerLot);
+  if(!CostFloor(side,r.price,InpLots,costs,floorprice)){StopRun("Initial TP cost conversion unavailable");return;}
+  r.tp=P(MMConstrainTP(side,r.tp,floorprice,g_ticksize));
+ }
  r.type_filling=ORDER_FILLING_RETURN;r.type_time=ORDER_TIME_GTC;r.expiration=0;
  long modes=SymbolInfoInteger(g_symbol,SYMBOL_EXPIRATION_MODE);
  // Prefer advertised GTC: Pepperstone rejected the short specified expiry (10022).
@@ -273,31 +342,83 @@ void PlaceEntry(const MqlTick &tick)
  r.comment="XEP demo probe";
  if(Send(r,"ENTRY",res)){g_nextside=-side;g_status="PENDING "+(side>0?"BUY":"SELL");}
 }
-void ManagePosition(ulong ticket,const MqlTick &tick,bool flatten,string reason)
+bool ManagePosition(ulong ticket,const MqlTick &tick)
 {
- if(!PositionSelectByTicket(ticket))return;
- ulong id=(ulong)PositionGetInteger(POSITION_IDENTIFIER);
- if(g_posid!=id)
- {
-  g_posid=id;long elapsed=(long)TimeCurrent()*1000-PositionGetInteger(POSITION_TIME_MSC);
-  g_posdeadlineus=StrategyNowUS()+(ulong)(MMRemainingHoldMs((double)elapsed,InpMaxHoldingSeconds*1000.0)*1000);g_modifyus=0;
- }
- bool holding=(StrategyNowUS()>=g_posdeadlineus);
- if(g_contaminated||g_closepending)return;
- if(flatten||holding){ClosePosition(ticket,holding?"HOLDING_LIMIT":reason);return;}
- if(!g_signal.ready||StrategyNowUS()-g_modifyus<(ulong)InpRefreshMs*1000)return;
+ if(!PositionSelectByTicket(ticket))return false;
+ int slot=g_positions.Find((ulong)PositionGetInteger(POSITION_IDENTIFIER));ulong now=StrategyNowUS();
+ if(g_contaminated||g_closepending||slot<0||!g_signal.ready||!g_positions.CanModify(slot,now,(ulong)InpRefreshMs*1000))return false;
+ // Record even a frozen/unchanged quote attempt so another position is not starved.
+ g_positions.RecordModification(slot,now);
  int side=PositionGetInteger(POSITION_TYPE)==POSITION_TYPE_BUY?1:-1;
  double sl=PositionGetDouble(POSITION_SL),oldtp=PositionGetDouble(POSITION_TP);
- if(sl<=0){StopRun("Position has no server stop loss");ClosePosition(ticket,"MISSING_SL");return;}
+ if(sl<=0){StopRun("Position has no server stop loss");ClosePosition(ticket,"MISSING_SL");return true;}
  double minimum=MinimumDistance();
  // Preserve SL; avoid modification if an existing stop is inside freeze range.
- if((side>0&&tick.bid-sl<minimum)||(side<0&&sl-tick.ask<minimum))return;
- if(oldtp>0&&((side>0&&oldtp-tick.bid<minimum)||(side<0&&tick.ask-oldtp<minimum)))return;
+ if((side>0&&tick.bid-sl<minimum)||(side<0&&sl-tick.ask<minimum))return false;
+ if(oldtp>0&&((side>0&&oldtp-tick.bid<minimum)||(side<0&&tick.ask-oldtp<minimum)))return false;
  double delta=MathMax(InpMinDistance,InpVolMultiplier*g_signal.sigma);
  double tp=P(MMExitTP(side,tick.bid,tick.ask,g_signal.sigma,delta,InpInventoryGamma,minimum,g_ticksize));
- g_modifyus=StrategyNowUS();if(MathAbs(tp-oldtp)<g_ticksize/2)return;
+ double floorprice=0,costs=0;
+ if(InpCostAwareTP)
+ {
+  ulong id=(ulong)PositionGetInteger(POSITION_IDENTIFIER);int k=LedgerLowerBound(id);
+  if(k>=ArraySize(g_ledger)||g_ledger[k].id!=id||g_ledger[k].entryvolume<=0)return false;
+  double volume=PositionGetDouble(POSITION_VOLUME);
+  costs=MMTargetCosts(g_ledger[k].entrycost,g_ledger[k].entryvolume,PositionGetDouble(POSITION_SWAP),volume,InpCommissionRoundTripPerLot);
+  if(!CostFloor(side,PositionGetDouble(POSITION_PRICE_OPEN),volume,costs,floorprice))
+  {StopRun("TP cost conversion unavailable");return true;}
+  tp=P(MMConstrainTP(side,tp,floorprice,g_ticksize));
+ }
+ if(MathAbs(tp-oldtp)<g_ticksize/2)return false;
+ Event("TP_TARGET",StringFormat("ticket=%I64u mode=%s old=%.8f new=%.8f floor=%.8f estimated_costs_gbp=%.4f buffer_gbp=%.4f",ticket,InpCostAwareTP?"COST_AWARE":"ORIGINAL",oldtp,tp,floorprice,costs,InpTPProfitBuffer));
  MqlTradeRequest r;MqlTradeResult res;ZeroMemory(r);r.action=TRADE_ACTION_SLTP;r.position=ticket;r.sl=sl;r.tp=tp;
- Send(r,"ADAPTIVE_TP",res);
+ Send(r,"ADAPTIVE_TP",res);return true;
+}
+bool ManagePositions(const MqlTick &tick,bool flatten,string reason)
+{
+ if(g_contaminated||g_closepending)return false;
+ ulong now=StrategyNowUS(),due=0,deadline=0;
+ for(int i=PositionsTotal()-1;i>=0;i--)
+ {
+  ulong t=PositionGetTicket(i);if(t==0||PositionGetString(POSITION_SYMBOL)!=g_symbol||PositionGetInteger(POSITION_MAGIC)!=InpMagic)continue;
+  int slot=g_positions.Find((ulong)PositionGetInteger(POSITION_IDENTIFIER));
+  if(slot<0){StopRun("Position missing holding timer");ClosePosition(t,"MISSING_TIMER");return true;}
+  if(flatten||g_positions.Due(slot,now))
+  {
+   ulong d=g_positions.Deadline(slot);if(due==0||d<deadline){due=t;deadline=d;}
+  }
+ }
+ if(due!=0){ClosePosition(due,flatten?reason:"HOLDING_LIMIT");return true;}
+ if(!g_signal.ready)return false;
+ // Oldest refresh attempt first: fixed list order can starve positions when
+ // the configured cap needs longer than one refresh interval to service.
+ for(int pass=0;pass<MM_MAX_POSITION_SLOTS;pass++)
+ {
+  ulong candidate=0,oldest=0;
+  for(int i=PositionsTotal()-1;i>=0;i--)
+  {
+   ulong t=PositionGetTicket(i);if(t==0||PositionGetString(POSITION_SYMBOL)!=g_symbol||PositionGetInteger(POSITION_MAGIC)!=InpMagic)continue;
+   int slot=g_positions.Find((ulong)PositionGetInteger(POSITION_IDENTIFIER));
+   if(slot<0||!g_positions.CanModify(slot,now,(ulong)InpRefreshMs*1000))continue;
+   ulong when=g_positions.ModifiedAt(slot);
+   if(candidate==0||when<oldest||(when==oldest&&t<candidate)){candidate=t;oldest=when;}
+  }
+  if(candidate==0)return false;
+  if(ManagePosition(candidate,tick))return true;
+ }
+ return false;
+}
+void CleanupOwnedPositions()
+{
+ // Teardown has no further timer callbacks. Attempt another close only when
+ // history confirms the previous one; an uncertain result remains blocked.
+ for(int i=0;i<MM_MAX_POSITION_SLOTS;i++)
+ {
+  g_historydirty=true;RefreshPnL();DrainDeals();ResolveClose();ResolveBarrier(g_entrybarrier);
+  if(g_closepending||g_ambiguous||g_contaminated)break;
+  Exposure e=Scan();if(e.foreign||e.exitorder!=0||e.position==0)break;
+  if(!ClosePosition(e.position,"REMOVE_EA"))break;
+ }
 }
 void TickRow(const MqlTick &t,string source,ulong observed)
 {W(FileWrite(g_ticks,source,observed,(long)UTCNow(),t.time_msc,t.bid,t.ask,t.last,t.volume,t.volume_real,t.flags));}
@@ -341,7 +462,7 @@ void RefreshPnL()
   ulong d=HistoryDealGetTicket(i);if(HistoryDealGetString(d,DEAL_SYMBOL)!=g_symbol||HistoryDealGetInteger(d,DEAL_MAGIC)!=InpMagic)continue;
   ulong id=(ulong)HistoryDealGetInteger(d,DEAL_POSITION_ID);if(id!=0)LedgerIndex(id);
  }
- g_realized=0;g_dayrealized=0;g_completed=0;
+ g_realized=0;g_dayrealized=0;g_completed=0;g_dayentries=0;
  long start=(long)g_day*86400+InpServerUTCOffsetHours*3600;
  for(int i=0;i<n;i++)
  {
@@ -357,10 +478,20 @@ void RefreshPnL()
   g_realized+=cash;if(HistoryDealGetInteger(d,DEAL_TIME)>=start)g_dayrealized+=cash;
   int k=LedgerIndex(id);long type=HistoryDealGetInteger(d,DEAL_TYPE),entry=HistoryDealGetInteger(d,DEAL_ENTRY);double vol=HistoryDealGetDouble(d,DEAL_VOLUME);
   if(type==DEAL_TYPE_BUY)g_ledger[k].netvol+=vol;if(type==DEAL_TYPE_SELL)g_ledger[k].netvol-=vol;
-  if(entry==DEAL_ENTRY_IN||entry==DEAL_ENTRY_INOUT)g_ledger[k].entry=true;
+  if(entry==DEAL_ENTRY_IN||entry==DEAL_ENTRY_INOUT)
+  {
+   g_ledger[k].entrycost+=MathMax(0,-HistoryDealGetDouble(d,DEAL_COMMISSION))+MathMax(0,-HistoryDealGetDouble(d,DEAL_FEE));
+   g_ledger[k].entryvolume+=vol;
+   g_ledger[k].entry=true;long opened=HistoryDealGetInteger(d,DEAL_TIME);
+   if(g_ledger[k].firstentry==0||opened<g_ledger[k].firstentry)g_ledger[k].firstentry=opened;
+  }
   if(entry==DEAL_ENTRY_OUT||entry==DEAL_ENTRY_OUT_BY||entry==DEAL_ENTRY_INOUT)g_ledger[k].exit=true;
  }
- for(int i=0;i<ArraySize(g_ledger);i++)if(g_ledger[i].entry&&g_ledger[i].exit&&MathAbs(g_ledger[i].netvol)<g_vstep/2)g_completed++;
+ for(int i=0;i<ArraySize(g_ledger);i++)
+ {
+  if(g_ledger[i].entry&&g_ledger[i].exit&&MathAbs(g_ledger[i].netvol)<g_vstep/2)g_completed++;
+  if(g_ledger[i].entry&&g_ledger[i].firstentry>=start&&g_ledger[i].firstentry<start+86400)g_dayentries++;
+ }
  // Select ticket list before LogDeal changes MT5's history selection.
  ulong recovery[];int count=0;
  ArrayResize(recovery,n);
@@ -401,20 +532,23 @@ void DrainDeals(){for(int i=ArraySize(g_dealQueue)-1;i>=0;i--)if(LogDeal(g_dealQ
 void Display()
 {
  string mode=g_test?"TESTER SIMULATION":"DEMO EXECUTION";
- Comment("XAU ExecutionProbe 1.04 | ",mode,"\n",g_status,"\nSymbol: ",g_symbol,"  Lots: ",DoubleToString(InpLots,3),"  Completed: ",g_completed,"/",InpTargetPositions,
+ Exposure e=Scan();
+ Comment("XAU ExecutionProbe v3.01 | ",mode,"\n",g_status,"\nSymbol: ",g_symbol,"  Lots per position: ",DoubleToString(InpLots,3),"  Open: ",e.positions,"/",InpMaxPositions,
+ "\nOpened today (UTC): ",g_dayentries,"/",InpMaxPositionsPerDay,"  Completed run: ",g_completed,"  Overall target (0=off): ",InpTargetPositions,
+ "\nGross open lots: ",DoubleToString(e.volume,3),"  Pending lots: ",DoubleToString(e.pendingvolume,3),"  Gross cap: ",DoubleToString(InpLots*InpMaxPositions,3),
  "\nWarmup: ",g_features.Count(),"/1001  sigma: ",DoubleToString(g_signal.sigma,3),"  momentum Z: ",DoubleToString(g_signal.z,2),
  "\nDay P&L: ",DoubleToString(g_dayrealized+g_float,2),"  Run P&L: ",DoubleToString(g_realized+g_float,2)," ",AccountInfoString(ACCOUNT_CURRENCY),
  "\nUTC session ",InpStartHourUTC,":00–",InpEndHourUTC,":00  |  log folder MQL5\\Files\\",g_folder,
- "\nOne entry order at a time. Pending wait is NOT network latency.");
+ "\nOne pending entry at a time; each position has its own exit timer.");
 }
 void FlushLogs(){FileFlush(g_ticks);FileFlush(g_requests);FileFlush(g_transactions);FileFlush(g_deals);FileFlush(g_events);}
 bool FinishTesterAtTarget(const Exposure &e)
 {
  // Finish only the tester sample target, after live exposure and fills agree.
- if(!g_test||g_testerstopping||!g_runhalt||g_completed<InpTargetPositions
+ if(!g_test||g_testerstopping||!g_runhalt||InpTargetPositions<=0||g_completed<InpTargetPositions
     ||g_ambiguous||g_contaminated||g_closepending
     ||g_entrybarrier!=0||g_closebarrier!=0
-    ||e.foreign||e.positions!=0||e.orders!=0||!LiveLedgerMatches())return false;
+    ||e.foreign||e.exitorder!=0||e.positions!=0||e.orders!=0||!LiveLedgerMatches())return false;
  g_testerstopping=true;
  Event("TESTER_COMPLETE","Target reached; completed partial-period test");
  SaveOrders();SaveRisk();GlobalVariablesFlush();FlushLogs();
@@ -433,10 +567,10 @@ void Drive()
  g_daypeak=MathMax(g_daypeak,dayp);g_runpeak=MathMax(g_runpeak,runp);
  if(!g_dayhalt&&MMRiskHit(dayp,g_daypeak,InpSessionLoss,InpSessionDrawdown)){g_dayhalt=true;Event("DAILY_HALT","Session loss or drawdown trigger");SaveRisk();GlobalVariablesFlush();}
  if(MMRiskHit(runp,g_runpeak,InpRunLoss,InpRunDrawdown))StopRun("Run loss or drawdown trigger");
- if(g_completed>=InpTargetPositions)StopRun("Target completed; collect CSV files");
+ if(InpTargetPositions>0&&g_completed>=InpTargetPositions)StopRun("Target completed; collect CSV files");
  if(g_iofail)StopRun("CSV logging failed");
  if(e.foreign)StopRun("Foreign XAU activity: isolate this demo symbol");
- if(e.positions>1||e.volume>InpLots+g_vstep/2||e.orders>1)StopRun("Inventory or order-count limit violated");
+ if(!MMExposureValid(e.positions,e.orders,e.volume,e.pendingvolume,InpLots,InpMaxPositions,g_vstep))StopRun("Inventory or order-count limit violated");
  if(g_errors>=InpMaxConsecutiveErrors)StopRun("Repeated broker rejections; inspect requests.csv");
  bool session=false,entrysession=false;MqlDateTime dt;TimeToStruct(UTCNow(),dt);int second=dt.hour*3600+dt.min*60+dt.sec;
  session=dt.day_of_week>=1&&dt.day_of_week<=5&&second>=InpStartHourUTC*3600&&second<InpEndHourUTC*3600;
@@ -451,30 +585,53 @@ void Drive()
  if(!TradePermissions()){g_status="Waiting: connection / Algo Trading permission";g_busy=false;return;}
  if(now<g_nexttradeus){g_busy=false;return;}
  ResolveClose();ResolveBarrier(g_entrybarrier);SaveOrders();e=Scan();
+ // Reconciliation may reveal a fill that arrived after the first exposure scan.
+ if(e.foreign)StopRun("Foreign XAU activity: isolate this demo symbol");
+ if(!MMExposureValid(e.positions,e.orders,e.volume,e.pendingvolume,InpLots,InpMaxPositions,g_vstep))StopRun("Inventory or order-count limit violated");
+ SyncPositionStates();
+ // Adopt a server-triggered exit into the same persistent close barrier as an
+ // EA close. ResolveBarrier requires the terminal order, deals and live ledger
+ // to agree before releasing it. No extra close or entry is sent meanwhile.
+ if(!g_closepending&&e.exitorder!=0)
+ {
+  g_closepending=true;g_closebarrier=e.exitorder;g_closedeal=0;
+  SaveOrders();GlobalVariablesFlush();
+  Event("SERVER_EXIT_PENDING",StringFormat("order=%I64u; reconcile own server TP/SL/stop-out",e.exitorder));
+ }
  if(FinishTesterAtTarget(e)){g_busy=false;return;}
  stop=g_runhalt||g_dayhalt||g_paused||!InpEnableDemoOrders;
  if(g_closepending){g_status="WAITING: reconcile close order and live exposure";g_busy=false;return;}
- if(e.positions>0)
+ // Cancel risky, expired or partially filled entry remainders before another trade.
+ bool cancelentry=e.orders>0&&(stop||!entrysession||!healthy||e.partial||e.positions>=InpMaxPositions||g_dayentries>=InpMaxPositionsPerDay
+    ||now-g_quoteus>=(ulong)InpRefreshMs*1000||now-g_quoteus>=(ulong)InpMaxQuoteAgeMs*1000);
+ // If an entry remains live after a cancel attempt, give position exits the
+ // next eligible pass. Rejected/delayed cancellations must not monopolize it.
+ bool managefirst=g_canceldeferred&&e.positions>0;g_canceldeferred=false;
+ if(cancelentry&&!managefirst)
  {
-  if(e.orders>0){Cancel(e.order,"CANCEL_REMAINDER_AFTER_FILL");g_busy=false;return;}
-  g_status=stop?"STOPPING: flatten owned position":"MANAGING POSITION";
-  if(hastick)ManagePosition(e.position,tick,stop||!session||!fresh,stop?"RISK_HALT":(!session?"SESSION_END":"STALE_FEED"));
-  g_busy=false;return;
+  Cancel(e.order,e.partial?"CANCEL_REMAINDER_AFTER_FILL":"ENTRY_FILTER_OR_LIMIT");g_canceldeferred=e.positions>0;g_busy=false;return;
  }
- g_posid=0;
- bool resolved=g_entrybarrier==0&&!g_closepending;
- MM_ACTION action=MMAction(stop,entrysession,healthy,false,e.orders>0,!resolved||g_ambiguous);
+ if(e.positions>0&&hastick)
+ {
+  g_status=stop?"STOPPING: flatten owned positions":"MANAGING POSITIONS";
+  if(ManagePositions(tick,stop||!session||!fresh,stop?"RISK_HALT":(!session?"SESSION_END":"STALE_FEED"))){g_busy=false;return;}
+ }
+ if(cancelentry)
+ {
+  Cancel(e.order,e.partial?"CANCEL_REMAINDER_AFTER_FILL":"ENTRY_FILTER_OR_LIMIT");g_canceldeferred=e.positions>0;g_busy=false;return;
+ }
+ bool resolved=g_entrybarrier==0&&!g_closepending&&LiveLedgerMatches();
  if(e.orders>0)
  {
-  bool old=now-g_quoteus>=(ulong)InpRefreshMs*1000;
-  if(action==MM_CANCEL||old||now-g_quoteus>=(ulong)InpMaxQuoteAgeMs*1000)Cancel(e.order,action==MM_CANCEL?"FILTER_OR_HALT":"REQUOTE");
-  g_status=stop?"STOPPED: cancelling entry":"PENDING ENTRY";g_busy=false;return;
+  g_status=stop?"STOPPED: cancelling entry":"PENDING ENTRY / MANAGING POSITIONS";g_busy=false;return;
  }
- if(action==MM_QUOTE){PlaceEntry(tick);g_busy=false;return;}
+ if(!stop&&entrysession&&healthy&&resolved&&!g_ambiguous&&EntryCapacity(e)){PlaceEntry(tick);g_busy=false;return;}
  if(g_ambiguous)g_status="STOPPED: uncertain broker result; inspect manually";
  else if(g_runhalt)g_status="RUN STOPPED: see events.csv";
  else if(g_dayhalt)g_status="DAILY LIMIT: resumes next UTC day";
  else if(g_paused||!InpEnableDemoOrders)g_status="PAUSED: recording only";
+ else if(g_dayentries>=InpMaxPositionsPerDay)g_status="DAILY POSITION LIMIT: entries resume next UTC day";
+ else if(e.positions>=InpMaxPositions)g_status="POSITION CAP: managing existing positions";
  else if(!entrysession)g_status="WAITING: outside UTC entry session";
  else if(!g_signal.ready)g_status="WARMUP: waiting for 1001 valid quotes";
  else if(!resolved)g_status="WAITING: reconcile previous order";
@@ -486,11 +643,14 @@ int OpenCSV(string name){return FileOpen(g_folder+"\\"+name,FILE_WRITE|FILE_CSV|
 void Meta(string key,string value){W(FileWrite(g_meta,key,Q(value)));}
 int OnInit()
 {
- g_test=(bool)MQLInfoInteger(MQL_TESTER);g_symbol=_Symbol;g_login=AccountInfoInteger(ACCOUNT_LOGIN);g_server=AccountInfoString(ACCOUNT_SERVER);g_features.Reset();g_signal=g_features.Signal(InpVolTicks);
+ g_test=(bool)MQLInfoInteger(MQL_TESTER);g_symbol=_Symbol;g_login=AccountInfoInteger(ACCOUNT_LOGIN);g_server=AccountInfoString(ACCOUNT_SERVER);g_features.Reset();g_positions.Reset();g_signal=g_features.Signal(InpVolTicks);
  if(!IsDemo()){Print("XEP: refused. Demo account only; no real-account override.");return INIT_FAILED;}
+ if(AccountInfoString(ACCOUNT_CURRENCY)!="GBP"){Print("XEP v3 requires GBP account/tester currency.");return INIT_PARAMETERS_INCORRECT;}
+ if(InpMaxPositions<1||InpMaxPositions>MM_MAX_POSITION_SLOTS||InpMaxPositionsPerDay<1){Print("InpMaxPositions must be 1..100; InpMaxPositionsPerDay must be positive.");return INIT_PARAMETERS_INCORRECT;}
+ if(InpMaxPositions>1&&AccountInfoInteger(ACCOUNT_MARGIN_MODE)!=ACCOUNT_MARGIN_MODE_RETAIL_HEDGING){Print("Multiple independent positions require a hedging account. For netting use InpMaxPositions=1.");return INIT_PARAMETERS_INCORRECT;}
  if(!g_test&&(!TerminalInfoInteger(TERMINAL_CONNECTED)||TimeCurrent()<=0)){Print("XEP: connect to your demo account before attaching.");return INIT_FAILED;}
  string upper=g_symbol;StringToUpper(upper);if(StringFind(upper,"XAUUSD")<0){Print("Attach to your XAUUSD chart (suffix allowed).");return INIT_PARAMETERS_INCORRECT;}
- if(InpMagic<=0||InpRunId<1||InpTargetPositions<1||InpVolTicks<50||InpVolTicks>500||InpLots<=0||InpMinDistance<=0||InpVolMultiplier<=0||InpInventoryGamma<0||InpMaxSpread<=0||InpVolSpikeRatio<=0||InpRefreshMs<250||InpMaxQuoteAgeMs<InpRefreshMs||InpMaxTickAgeMs<500||InpSessionLoss<=0||InpSessionDrawdown<=0||InpRunLoss<=0||InpRunDrawdown<=0||InpMinStopDistance<=0||InpStopDistanceMultiplier<=0||InpMaxHoldingSeconds<1||InpMaxConsecutiveErrors<1||InpStartHourUTC<0||InpEndHourUTC>24||InpStartHourUTC>=InpEndHourUTC||InpMaxHoldingSeconds>=(InpEndHourUTC-InpStartHourUTC)*3600||InpTimerMs<50||InpTimerMs>1000||InpServerUTCOffsetHours< -12||InpServerUTCOffsetHours>14)return INIT_PARAMETERS_INCORRECT;
+ if(!MathIsValidNumber(InpCommissionRoundTripPerLot)||!MathIsValidNumber(InpTPProfitBuffer)||InpCommissionRoundTripPerLot<0||InpTPProfitBuffer<0||InpMagic<=0||InpRunId<1||InpTargetPositions<0||InpVolTicks<50||InpVolTicks>500||InpLots<=0||InpMinDistance<=0||InpVolMultiplier<=0||InpInventoryGamma<0||InpMaxSpread<=0||InpVolSpikeRatio<=0||InpRefreshMs<250||InpMaxQuoteAgeMs<InpRefreshMs||InpMaxTickAgeMs<500||InpSessionLoss<=0||InpSessionDrawdown<=0||InpRunLoss<=0||InpRunDrawdown<=0||InpMinStopDistance<=0||InpStopDistanceMultiplier<=0||InpMaxHoldingSeconds<1||InpMaxConsecutiveErrors<1||InpStartHourUTC<0||InpEndHourUTC>24||InpStartHourUTC>=InpEndHourUTC||InpMaxHoldingSeconds>=(InpEndHourUTC-InpStartHourUTC)*3600||InpTimerMs<50||InpTimerMs>1000||InpServerUTCOffsetHours< -12||InpServerUTCOffsetHours>14)return INIT_PARAMETERS_INCORRECT;
  if(!SymbolSelect(g_symbol,true))return INIT_FAILED;
  g_ticksize=SymbolInfoDouble(g_symbol,SYMBOL_TRADE_TICK_SIZE);g_point=SymbolInfoDouble(g_symbol,SYMBOL_POINT);g_digits=(int)SymbolInfoInteger(g_symbol,SYMBOL_DIGITS);g_vstep=SymbolInfoDouble(g_symbol,SYMBOL_VOLUME_STEP);
  if(g_ticksize<=0||g_point<=0||!MMVolumeValid(InpLots,SymbolInfoDouble(g_symbol,SYMBOL_VOLUME_MIN),SymbolInfoDouble(g_symbol,SYMBOL_VOLUME_MAX),g_vstep)){Print("XEP: invalid lot size or symbol specifications; size is never rounded up.");return INIT_PARAMETERS_INCORRECT;}
@@ -499,12 +659,12 @@ int OnInit()
  g_lock="XEP_LOCK_"+IdentityHash()+(g_test?"_T":"_D");
  GlobalVariableTemp(g_lock);g_locktoken=(double)ChartID();if(g_locktoken==0)g_locktoken=1;
  if(!GlobalVariableSetOnCondition(g_lock,g_locktoken,0)){Print("XEP: another instance owns this account/symbol. Remove it first.");return INIT_FAILED;}g_ownedlock=true;
- g_key="XEP_"+IdentityHash()+"_"+IntegerToString(InpRunId)+"_"+IntegerToString(InpMagic)+(g_test?"_T":"_D");
+ g_key="XEP3_"+IdentityHash()+"_"+IntegerToString(InpRunId)+"_"+IntegerToString(InpMagic)+(g_test?"_T":"_D");
  if(StringLen(g_key)>55){Print("XEP: state key too long for terminal global variables.");return INIT_PARAMETERS_INCORRECT;}
  Exposure e=Scan();if(e.foreign){Print("XEP: remove foreign XAUUSD trades/orders or use a separate demo account.");return INIT_FAILED;}
  if(!GlobalVariableCheck(g_key+".epoch"))
  {
-  if(e.positions>0||e.orders>0){Print("New RunId requires a flat symbol with no pending orders.");return INIT_FAILED;}
+  if(e.positions>0||e.orders>0||e.exitorder!=0){Print("New RunId requires a flat symbol with no pending orders or settling server exits.");return INIT_FAILED;}
   GlobalVariableSet(g_key+".epoch",(double)TimeCurrent());
  }
  g_epoch=(datetime)GlobalVariableGet(g_key+".epoch");g_day=DayNumber();
@@ -516,8 +676,8 @@ int OnInit()
  g_entrybarrier=LoadTicket(".en");g_closebarrier=LoadTicket(".cl");g_closedeal=LoadTicket(".de");g_closepending=GlobalVariableCheck(g_key+".cp")&&GlobalVariableGet(g_key+".cp")>0;
  if(GlobalVariableCheck(g_key+".day")&&(int)GlobalVariableGet(g_key+".day")==g_day){g_daypeak=GlobalVariableGet(g_key+".dp");g_dayhalt=GlobalVariableGet(g_key+".dh")>0;}
  string stamp=SafeName(TimeToString(TimeLocal(),TIME_DATE|TIME_SECONDS));
- g_folder="XAU_ExecutionProbe\\"+SafeName(g_symbol)+"_"+stamp+"_"+IntegerToString((long)GetTickCount64());
- FolderCreate("XAU_ExecutionProbe");FolderCreate(g_folder);
+ g_folder="XAU_ExecutionProbe_v3\\"+SafeName(g_symbol)+"_"+stamp+"_"+IntegerToString((long)GetTickCount64());
+ FolderCreate("XAU_ExecutionProbe_v3");FolderCreate(g_folder);
  g_meta=OpenCSV("metadata.csv");g_ticks=OpenCSV("ticks.csv");g_requests=OpenCSV("requests.csv");g_transactions=OpenCSV("transactions.csv");g_deals=OpenCSV("deals.csv");g_events=OpenCSV("events.csv");
  if(g_meta==INVALID_HANDLE||g_ticks==INVALID_HANDLE||g_requests==INVALID_HANDLE||g_transactions==INVALID_HANDLE||g_deals==INVALID_HANDLE||g_events==INVALID_HANDLE){Print("XEP: could not create all CSV files.");return INIT_FAILED;}
  W(FileWrite(g_meta,"key","value"));
@@ -526,7 +686,8 @@ int OnInit()
  W(FileWrite(g_transactions,"observed_mono_us","local_utc_seconds","transaction_type","order","deal","position","order_type","order_state","deal_type","price","volume","request_id","request_retcode","snapshot_server_msc","snapshot_bid","snapshot_ask"));
  W(FileWrite(g_deals,"source","observed_mono_us","local_utc_seconds","deal","order","position_id","magic","deal_server_msc","deal_type","deal_entry","deal_reason","volume","fill_price","profit","commission","swap","fee","history_order_type","history_order_price","history_order_sl","history_order_tp","order_setup_server_msc","order_done_server_msc","snapshot_server_msc","snapshot_bid","snapshot_ask"));
  W(FileWrite(g_events,"observed_mono_us","local_utc_seconds","event","message"));
- Meta("version","1.04");Meta("mode",g_test?"TESTER_SIMULATION":"DEMO_FORWARD");Meta("symbol",g_symbol);Meta("server",AccountInfoString(ACCOUNT_SERVER));Meta("account_identity_hash",IdentityHash());Meta("account_currency",AccountInfoString(ACCOUNT_CURRENCY));Meta("margin_mode",IntegerToString(AccountInfoInteger(ACCOUNT_MARGIN_MODE)));
+ Meta("version","3.01");Meta("mode",g_test?"TESTER_SIMULATION":"DEMO_FORWARD");Meta("symbol",g_symbol);Meta("server",AccountInfoString(ACCOUNT_SERVER));Meta("account_identity_hash",IdentityHash());Meta("account_currency",AccountInfoString(ACCOUNT_CURRENCY));Meta("margin_mode",IntegerToString(AccountInfoInteger(ACCOUNT_MARGIN_MODE)));
+ Meta("max_positions",IntegerToString(InpMaxPositions));Meta("daily_position_limit",IntegerToString(InpMaxPositionsPerDay));Meta("daily_position_boundary","00:00 UTC; first entry per position identifier");Meta("max_gross_lots",DoubleToString(InpLots*InpMaxPositions,8));Meta("gamma_mode","unchanged per-position normalized direction +/-1");
  Meta("strategy_clock",g_test?"SIMULATED_SERVER_AND_TICK_TIME":"HOST_MONOTONIC");Meta("observation_clock","HOST_MONOTONIC");Meta("tick_ingestion",g_test?"TESTER_ONTICK_ONLY":"COPYTICKS_HISTORY_AND_ONTICK_SNAPSHOTS");
  Meta("contract_size",DoubleToString(SymbolInfoDouble(g_symbol,SYMBOL_TRADE_CONTRACT_SIZE),8));Meta("tick_size",DoubleToString(g_ticksize,8));Meta("tick_value",DoubleToString(SymbolInfoDouble(g_symbol,SYMBOL_TRADE_TICK_VALUE),8));
  Meta("volume_min",DoubleToString(SymbolInfoDouble(g_symbol,SYMBOL_VOLUME_MIN),8));Meta("volume_step",DoubleToString(g_vstep,8));Meta("volume_max",DoubleToString(SymbolInfoDouble(g_symbol,SYMBOL_VOLUME_MAX),8));Meta("volume_limit",DoubleToString(SymbolInfoDouble(g_symbol,SYMBOL_VOLUME_LIMIT),8));
@@ -537,10 +698,15 @@ int OnInit()
  Meta("input.InpMagic",IntegerToString(InpMagic));
  Meta("input.InpRunId",IntegerToString(InpRunId));
  Meta("input.InpLots",DoubleToString(InpLots,10));
+ Meta("input.InpMaxPositions",IntegerToString(InpMaxPositions));
+ Meta("input.InpMaxPositionsPerDay",IntegerToString(InpMaxPositionsPerDay));
  Meta("input.InpTargetPositions",IntegerToString(InpTargetPositions));
  Meta("input.InpVolTicks",IntegerToString(InpVolTicks));
  Meta("input.InpMinDistance",DoubleToString(InpMinDistance,10));
  Meta("input.InpVolMultiplier",DoubleToString(InpVolMultiplier,10));
+ Meta("input.InpCostAwareTP",InpCostAwareTP?"true":"false");
+ Meta("input.InpCommissionRoundTripPerLot",DoubleToString(InpCommissionRoundTripPerLot,2));
+ Meta("input.InpTPProfitBuffer",DoubleToString(InpTPProfitBuffer,2));
  Meta("input.InpInventoryGamma",DoubleToString(InpInventoryGamma,10));
  Meta("input.InpMomentumProtection",(InpMomentumProtection?"true":"false"));
  Meta("input.InpMaxSpread",DoubleToString(InpMaxSpread,10));
@@ -565,7 +731,7 @@ int OnInit()
  if(!EventSetMillisecondTimer(InpTimerMs))return INIT_FAILED;
  ObjectCreate(0,BUTTON,OBJ_BUTTON,0,0,0);ObjectSetInteger(0,BUTTON,OBJPROP_XDISTANCE,12);ObjectSetInteger(0,BUTTON,OBJPROP_YDISTANCE,170);ObjectSetInteger(0,BUTTON,OBJPROP_XSIZE,180);ObjectSetInteger(0,BUTTON,OBJPROP_YSIZE,28);ObjectSetString(0,BUTTON,OBJPROP_TEXT,"STOP & FLATTEN");
  if(g_entrybarrier==0&&!g_closepending)g_entrybarrier=e.order;g_quoteus=0;g_ready=true;
- Event("START",g_test?"Simulated tester execution only; source logger v1.04":"Demo forward execution; source logger v1.04");
+ Event("START",g_test?"Simulated tester execution only; source logger v3.01":"GBP demo forward execution; source logger v3.01");
  Print("XEP files: ",TerminalInfoString(TERMINAL_DATA_PATH),"\\MQL5\\Files\\",g_folder);
  RefreshPnL();PumpTicks();Display();return INIT_SUCCEEDED;
 }
@@ -597,7 +763,7 @@ void OnTradeTransaction(const MqlTradeTransaction &t,const MqlTradeRequest &r,co
  g_summaryus=0;
 }
 void OnChartEvent(const int id,const long &lparam,const double &dparam,const string &sparam)
-{if(id==CHARTEVENT_OBJECT_CLICK&&sparam==BUTTON){g_paused=true;Event("USER_STOP","Cancel entry and flatten owned position when broker permits");ObjectSetInteger(0,BUTTON,OBJPROP_STATE,false);}}
+{if(id==CHARTEVENT_OBJECT_CLICK&&sparam==BUTTON){g_paused=true;Event("USER_STOP","Cancel entry and flatten all owned positions when broker permits");ObjectSetInteger(0,BUTTON,OBJPROP_STATE,false);}}
 void OnDeinit(const int reason)
 {
  EventKillTimer();
@@ -607,7 +773,7 @@ void OnDeinit(const int reason)
   if(IsDemo()&&TradePermissions())
   {
    Exposure e=Scan();if(e.order!=0&&e.order!=g_closebarrier)Cancel(e.order,"REMOVE_EA");
-   e=Scan();if(InpFlattenOnRemove&&e.position!=0)ClosePosition(e.position,"REMOVE_EA");
+   if(InpFlattenOnRemove)CleanupOwnedPositions();
   }
   if(AccountMatches()){g_historydirty=true;RefreshPnL();DrainDeals();ResolveClose();ResolveBarrier(g_entrybarrier);SaveOrders();SaveRisk();GlobalVariablesFlush();}
   Exposure e=Scan();if(e.positions>0||e.orders>0)Print("XEP WARNING: orders/positions remain. Inspect Trade tab and close/cancel manually. Server SL/TP remain; terminal timers stop now.");

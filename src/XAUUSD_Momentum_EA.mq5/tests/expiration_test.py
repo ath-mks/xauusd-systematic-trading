@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 class ExpirationSelection(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        source = (ROOT / 'XAU_ExecutionProbe.mq5').read_text()
+        source = (ROOT / 'XAU_ExecutionProbe_v3.mq5').read_text()
         start = source.index(' r.type_filling=ORDER_FILLING_RETURN;', source.index('void PlaceEntry('))
         end = source.index(' r.comment=', start)
         actual_block = source[start:end]

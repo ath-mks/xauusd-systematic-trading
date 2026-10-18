@@ -1,1 +1,0 @@
-source,observed_mono_us,local_utc_seconds,deal,order,position_id,magic,deal_server_msc,deal_type,deal_entry,deal_reason,volume,fill_price,profit,commission,swap,fee,history_order_type,history_order_price,history_order_sl,history_order_tp,order_setup_server_msc,order_done_server_msc,snapshot_server_msc,snapshot_bid,snapshot_ask

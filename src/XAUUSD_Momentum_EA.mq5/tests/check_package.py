@@ -1,7 +1,7 @@
 from pathlib import Path
 import re, unittest
 P=Path(__file__).resolve().parents[1]
-S=(P/'XAU_ExecutionProbe.mq5').read_text()
+S=(P/'XAU_ExecutionProbe_v3.mq5').read_text()
 
 def arguments_at(text,pos):
     start=text.index('(',pos)+1;depth=1;quoted=False;escaped=False;args=[];last=start
@@ -22,7 +22,8 @@ def arguments_at(text,pos):
 class Packaging(unittest.TestCase):
     def test_preset_matches_inputs(self):
         expected=dict(re.findall(r'^input\s+(?:bool|int|long|double)\s+(Inp\w+)\s*=\s*([^;]+);',S,re.M))
-        actual=dict(x.split('=',1) for x in (P/'XAU_Demo_Execution.set').read_text().splitlines() if x and not x.startswith(';'))
+        actual=dict(x.split('=',1) for x in (P/'XAU_v3_GBP_1Position_CostAware.set').read_text().splitlines() if x and not x.startswith(';'))
+        expected['InpRunId']='11'
         self.assertEqual(expected,actual)
         for name in expected:self.assertTrue('"input.'+name+'"' in S,name)
     def test_csv_headers_match_writes(self):

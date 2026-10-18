@@ -10,7 +10,7 @@ import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-SOURCE = (ROOT / 'XAU_ExecutionProbe.mq5').read_text()
+SOURCE = (ROOT / 'XAU_ExecutionProbe_v3.mq5').read_text()
 
 
 def function(name):

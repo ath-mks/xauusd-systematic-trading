@@ -1,0 +1,35 @@
+; v3.01: settings from the observed demo run; new RunId for the halted run
+; Original mode, 0.10 lot, 1 position, 60 seconds, all-day UTC session.
+InpEnableDemoOrders=true
+InpMagic=26101503
+InpRunId=30110
+InpLots=0.1000000000
+InpMaxPositions=1
+InpMaxPositionsPerDay=2000
+InpTargetPositions=0
+InpVolTicks=500
+InpMinDistance=0.1000000000
+InpVolMultiplier=1.0000000000
+InpCostAwareTP=false
+InpCommissionRoundTripPerLot=4.50
+InpTPProfitBuffer=0.10
+InpInventoryGamma=0.5706715943
+InpMomentumProtection=true
+InpMaxSpread=0.2000000000
+InpVolSpikeRatio=2.0000000000
+InpRefreshMs=3000
+InpMaxQuoteAgeMs=6000
+InpMaxTickAgeMs=5000
+InpSessionLoss=100.0000000000
+InpSessionDrawdown=100.0000000000
+InpRunLoss=300.0000000000
+InpRunDrawdown=300.0000000000
+InpMinStopDistance=0.5000000000
+InpStopDistanceMultiplier=4.0000000000
+InpMaxHoldingSeconds=60
+InpFlattenOnRemove=true
+InpMaxConsecutiveErrors=5
+InpStartHourUTC=0
+InpEndHourUTC=24
+InpServerUTCOffsetHours=3
+InpTimerMs=100

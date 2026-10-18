@@ -45,6 +45,20 @@ bool MMFeedFresh(double now,double last,double brokerage,double maxage)
 {return last>0&&now>=last&&(now-last)<=maxage*1000&&brokerage>=-2000&&brokerage<=maxage;}
 bool MMVolumesMatch(double expected,double observed,double step)
 {return MathAbs(expected-observed)<step/2;}
+// Reserve all outstanding entry volume, including a partially filled remainder.
+bool MMExposureValid(int positions,int orders,double volume,double pending,double lots,int maximum,double step)
+{
+ return maximum>=1&&lots>0&&step>0&&positions>=0&&orders>=0&&orders<=1
+        &&positions<=maximum&&volume>=0&&pending>=0
+        &&volume+pending<=lots*maximum+step/2;
+}
+bool MMEntryAllowed(int positions,int orders,double volume,double pending,double lots,int maximum,double step,int completed,int target)
+{
+ return MMExposureValid(positions,orders,volume,pending,lots,maximum,step)
+        &&orders==0&&positions<maximum&&completed>=0&&target>=0
+        &&(target==0||(completed<target&&positions<target-completed))
+        &&volume+pending+lots<=lots*maximum+step/2;
+}
 enum MM_ACTION {MM_WAIT,MM_QUOTE,MM_CANCEL,MM_MANAGE,MM_FLATTEN};
 MM_ACTION MMAction(bool halted,bool entryok,bool healthy,bool position,bool order,bool unresolved)
 {
@@ -53,4 +67,17 @@ MM_ACTION MMAction(bool halted,bool entryok,bool healthy,bool position,bool orde
  if(halted||!entryok||!healthy||unresolved||order)return MM_WAIT;
  return MM_QUOTE;
 }
+// Costs are positive GBP deductions; entry cost is allocated to remaining volume.
+double MMTargetCosts(double entrycost,double entryvolume,double swap,double volume,double roundtrip)
+{
+ double entry=entryvolume>0?entrycost*volume/entryvolume:roundtrip*volume/2;
+ return MathMax(0,entry)+roundtrip*volume/2+MathMax(0,-swap);
+}
+double MMCostFloor(int side,double entry,double costs,double buffer,double moneyperprice,double tick)
+{
+ if(moneyperprice<=0||tick<=0||entry<=0)return 0;
+ return MMRound(entry+side*(costs+buffer)/moneyperprice,tick,side);
+}
+double MMConstrainTP(int side,double candidate,double floorprice,double tick)
+{return MMRound(side>0?MathMax(candidate,floorprice):MathMin(candidate,floorprice),tick,side);}
 #endif

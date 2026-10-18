@@ -1,0 +1,4 @@
+observed_mono_us,local_utc_seconds,event,message
+7099,1791909507,START,"Demo forward execution; source logger v1.00"
+36295390,1791909544,USER_STOP,"Cancel entry and flatten owned position when broker permits"
+180715166,1791909688,DEINIT,"Reason 1; best-effort cleanup"

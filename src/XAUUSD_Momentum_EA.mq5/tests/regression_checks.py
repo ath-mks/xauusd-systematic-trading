@@ -1,7 +1,7 @@
 """Source integration checks, not a substitute for MetaEditor/broker tests."""
 from pathlib import Path
 import unittest
-S=(Path(__file__).resolve().parents[1]/'XAU_ExecutionProbe.mq5').read_text()
+S=(Path(__file__).resolve().parents[1]/'XAU_ExecutionProbe_v3.mq5').read_text()
 class ControllerRegression(unittest.TestCase):
  def test_clock_read_after_history_pump(self):
   self.assertIn('PumpTicks();DrainDeals();now=StrategyNowUS();',S)
@@ -10,7 +10,9 @@ class ControllerRegression(unittest.TestCase):
  def test_quote_age_checked_separately(self):
   self.assertIn('MMFeedFresh(',S)
  def test_restart_uses_remaining_holding_budget(self):
-  self.assertIn('MMRemainingHoldMs(',S)
+  self.assertIn('g_positions.Track(',S)
+  core=(Path(__file__).resolve().parents[1]/'MMPositionBook.mqh').read_text()
+  self.assertIn('MMRemainingHoldMs(',core)
  def test_barrier_reconciles_fills_and_live_inventory(self):
   self.assertIn('HistoryOrderGetDouble(ticket,ORDER_VOLUME_INITIAL)',S)
   self.assertIn('LiveLedgerMatches()',S)
